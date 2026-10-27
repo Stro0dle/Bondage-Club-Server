@@ -93,6 +93,8 @@ const CLIENT_MESSAGE_BURST = parseInt(process.env.CLIENT_MESSAGE_BURST, 10) || C
 /** @type {Record<string, [number, number]>} */
 const EVENT_RATE_LIMITS = { ChatRoomSearch: [1, 10], AccountQuery: [2, 10] };
 const EVENT_RATE_LIMIT_SCALE = parseFloat(process.env.EVENT_RATE_LIMIT_SCALE) || 1; // Multiplies the limits above
+const BEEP_RATE_LIMIT = 2; // Beeps a player can send per second
+const BEEP_BURST = 20; // Beeps a player can send at once
 const MAX_PACKET_DEPTH = 100; // Maximum nesting of objects & arrays in a client packet
 const IP_CONNECTION_PROXY_HEADER = "x-forwarded-for"; // Header with real IP, if set by trusted proxy (lowercase)
 const ROOM_LIMIT_DEFAULT = 10; // The default number of players in an online chat room
@@ -193,6 +195,9 @@ const IPConnections = new Map();
 
 /** @type {Map<string, TokenBucket>} */
 const IPConnectionBuckets = new Map();
+
+/** @type {WeakMap<ServerSocket, TokenBucket>} */
+const BeepBuckets = new WeakMap();
 
 const SERVER_EVENT_LOOP_RESOLUTION = 20;
 const ServerEventLoopDelay = monitorEventLoopDelay({ resolution: SERVER_EVENT_LOOP_RESOLUTION });
@@ -1366,6 +1371,9 @@ function AccountBeep(data, socket) {
 			const IsOwner = (OtherAcc.Ownership != null) && (OtherAcc.Ownership.MemberNumber != null) && (OtherAcc.Ownership.MemberNumber == Acc.MemberNumber);
 			const IsLeash = (data.BeepType != null) && (typeof data.BeepType === "string") && (data.BeepType == "Leash") && Array.isArray(OtherAcc.BlackList) && (OtherAcc.BlackList.indexOf(Acc.MemberNumber) < 0);
 			if (!IsFriend && !IsOwner && !IsLeash) return;
+
+			if (!BeepBuckets.has(socket)) BeepBuckets.set(socket, CommonTokenBucket(BEEP_RATE_LIMIT, BEEP_BURST));
+			if (!CommonTokenBucketTake(/** @type {TokenBucket} */ (BeepBuckets.get(socket)), false)) return;
 
 			OtherAcc.Socket.emit("AccountBeep", {
 				MemberNumber: Acc.MemberNumber,

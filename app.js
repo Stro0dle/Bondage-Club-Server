@@ -1407,25 +1407,56 @@ function AccountBeep(data, socket) {
 	}
 }
 
-// Updates an account appearance if needed
-function AccountDelayedUpdateOne(AccountName, NewAppearance, NewSkill, NewGame) {
-	if ((AccountName == null) || ((NewAppearance == null) && (NewSkill == null) && (NewGame == null))) return;
+/**
+ * Builds the $set object of the delayed updates of an account, returns null if there's nothing to update
+ * @param {Account["DelayedAppearanceUpdate"]} NewAppearance
+ * @param {Account["DelayedSkillUpdate"]} NewSkill
+ * @param {Account["DelayedGameUpdate"]} NewGame
+ * @returns {Partial<Account>|null}
+ */
+function AccountDelayedUpdateObject(NewAppearance, NewSkill, NewGame) {
+	if ((NewAppearance == null) && (NewSkill == null) && (NewGame == null)) return null;
+	/** @type {Partial<Account>} */
 	let UpdateObj = {};
 	if (NewAppearance != null) UpdateObj.Appearance = NewAppearance;
 	if (NewSkill != null) UpdateObj.Skill = NewSkill;
 	if (NewGame != null) UpdateObj.Game = NewGame;
+	return UpdateObj;
+}
+
+// Updates an account appearance if needed
+function AccountDelayedUpdateOne(AccountName, NewAppearance, NewSkill, NewGame) {
+	const UpdateObj = AccountDelayedUpdateObject(NewAppearance, NewSkill, NewGame);
+	if ((AccountName == null) || (UpdateObj == null)) return;
 	Database.collection(AccountCollection).updateOne({ AccountName: AccountName }, { $set: UpdateObj }, DatabaseLogError("updating an account"));
 }
 
-// Called every X seconds to update the database with appearance updates
-function AccountDelayedUpdate() {
+/**
+ * Called every X seconds to update the database with appearance updates, in a single write
+ * @returns {Promise<void>} Resolves once the database is updated, never rejects
+ */
+async function AccountDelayedUpdate() {
+	const Operations = [];
 	for (const Acc of Account) {
 		if (Acc != null) {
-			AccountDelayedUpdateOne(Acc.AccountName, Acc.DelayedAppearanceUpdate, Acc.DelayedSkillUpdate, Acc.DelayedGameUpdate);
+			const UpdateObj = AccountDelayedUpdateObject(Acc.DelayedAppearanceUpdate, Acc.DelayedSkillUpdate, Acc.DelayedGameUpdate);
+			if ((Acc.AccountName != null) && (UpdateObj != null))
+				Operations.push({ updateOne: { filter: { AccountName: Acc.AccountName }, update: { $set: UpdateObj } } });
 			delete Acc.DelayedAppearanceUpdate;
 			delete Acc.DelayedSkillUpdate;
 			delete Acc.DelayedGameUpdate;
 		}
+	}
+	if (Operations.length == 0) return;
+	const Collection = Database.collection(AccountCollection);
+	try {
+		await Collection.bulkWrite(Operations, { ordered: false });
+	} catch (err) {
+		// Retries one by one, so one bad document doesn't lose the updates of everyone
+		DatabaseError("doing delayed updates, retrying them one by one", err);
+		await Promise.all(Operations.map(Op =>
+			Collection.updateOne(Op.updateOne.filter, Op.updateOne.update)
+				.catch(err => DatabaseError("doing delayed update for account " + Op.updateOne.filter.AccountName, err))));
 	}
 }
 

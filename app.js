@@ -86,7 +86,13 @@ var LovershipDelay = 604800000; // 7 days delay for lovership events
 var DifficultyDelay = 604800000; // 7 days to activate the higher difficulty tiers
 const IP_CONNECTION_LIMIT = parseInt(process.env.IP_CONNECTION_LIMIT, 10) || 64; // Limit of connections per IP address
 const IP_CONNECTION_RATE_LIMIT = parseInt(process.env.IP_CONNECTION_RATE_LIMIT, 10) || 2; // Limit of newly established connections per IP address within a second
+const IP_CONNECTION_BURST = parseInt(process.env.IP_CONNECTION_BURST, 10) || 10; // Number of connections an IP address can open at once
 const CLIENT_MESSAGE_RATE_LIMIT = parseInt(process.env.CLIENT_MESSAGE_RATE_LIMIT, 10) || 20; // Limit the number of messages received from a client within a second
+const CLIENT_MESSAGE_BURST = parseInt(process.env.CLIENT_MESSAGE_BURST, 10) || CLIENT_MESSAGE_RATE_LIMIT * 3; // Number of messages a client can send at once
+// Rate limits of the expensive events [per second, burst]
+/** @type {Record<string, [number, number]>} */
+const EVENT_RATE_LIMITS = { ChatRoomSearch: [1, 10], AccountQuery: [2, 10] };
+const EVENT_RATE_LIMIT_SCALE = parseFloat(process.env.EVENT_RATE_LIMIT_SCALE) || 1; // Multiplies the limits above
 const MAX_PACKET_DEPTH = 100; // Maximum nesting of objects & arrays in a client packet
 const IP_CONNECTION_PROXY_HEADER = "x-forwarded-for"; // Header with real IP, if set by trusted proxy (lowercase)
 const ROOM_LIMIT_DEFAULT = 10; // The default number of players in an online chat room
@@ -180,8 +186,13 @@ process.on('SIGTERM', function() {
 			Acc.Socket.emit("ServerMessage", "Server will reboot in 30 seconds." );
 });
 
-/** @type {Map<string, number[]>} */
+/** @type {Map<string, number>} */
 const IPConnections = new Map();
+
+/** @typedef {{ Rate: number; Burst: number; Tokens: number; Time: number; }} TokenBucket */
+
+/** @type {Map<string, TokenBucket>} */
+const IPConnectionBuckets = new Map();
 
 const SERVER_EVENT_LOOP_RESOLUTION = 20;
 const ServerEventLoopDelay = monitorEventLoopDelay({ resolution: SERVER_EVENT_LOOP_RESOLUTION });
@@ -296,44 +307,41 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 				const address = AccountGetIP(socket);
 				socket.on("disconnect", reason => CommonCount(ServerStats.Disconnects, reason));
 
-				const sameIPConnections = IPConnections.get(address) || [];
-
-				// True, if there has already been IP_CONNECTION_RATE_LIMIT number of connections in the last second
-				const ipOverRateLimit = sameIPConnections.length >= IP_CONNECTION_RATE_LIMIT && Date.now() - sameIPConnections[sameIPConnections.length - IP_CONNECTION_RATE_LIMIT] <= 1000;
-
 				// Reject connection if over limits (rate & concurrency)
-				if (sameIPConnections.length >= IP_CONNECTION_LIMIT || ipOverRateLimit) {
+				const sameIPConnections = IPConnections.get(address) || 0;
+				if (!IPConnectionBuckets.has(address)) IPConnectionBuckets.set(address, CommonTokenBucket(IP_CONNECTION_RATE_LIMIT, IP_CONNECTION_BURST));
+				if ((sameIPConnections >= IP_CONNECTION_LIMIT) || !CommonTokenBucketTake(/** @type {TokenBucket} */ (IPConnectionBuckets.get(address)), false)) {
 					ServerKick(socket, "ConnectionLimit", "Rejecting connection (IP connection limit reached) from " + address);
 					return;
 				}
 
 				// Connection accepted, count it
-				sameIPConnections.push(Date.now());
-				IPConnections.set(address, sameIPConnections);
+				IPConnections.set(address, sameIPConnections + 1);
 				socket.once("disconnect", () => {
-					const sameIPConnectionsDisconnect = IPConnections.get(address) || [];
-					if (sameIPConnectionsDisconnect.length <= 1) {
-						IPConnections.delete(address);
-					} else {
-						sameIPConnectionsDisconnect.shift(); // Delete first (oldest) from array
-						IPConnections.set(address, sameIPConnectionsDisconnect);
-					}
+					const Count = (IPConnections.get(address) || 1) - 1;
+					if (Count <= 0) IPConnections.delete(address);
+					else IPConnections.set(address, Count);
 				});
 
-				// Rate limit all messages and kill the connection, if limits exceeded.
-				const messageBucket = [];
-				for (let i = 0; i < CLIENT_MESSAGE_RATE_LIMIT; i++) {
-					messageBucket.push(0);
-				}
-				socket.onAny(() => {
-					const lastMessageTime = messageBucket.shift();
-					messageBucket.push(Date.now());
-
-					// More than CLIENT_MESSAGE_RATE_LIMIT number of messages in the last second
-					if (Date.now() - lastMessageTime <= 1000) {
-						// Disconnect and close connection
-						ServerKick(socket, "RateLimited");
+				// Rate limit all messages, drop the extra ones and kill the connection if the client keeps flooding
+				const MessageBucket = CommonTokenBucket(CLIENT_MESSAGE_RATE_LIMIT, CLIENT_MESSAGE_BURST);
+				/** @type {Map<string, TokenBucket>} */
+				const EventBuckets = new Map();
+				socket.use((packet, next) => {
+					if (!CommonTokenBucketTake(MessageBucket, true)) {
+						ServerStats.DroppedMessages++;
+						if (MessageBucket.Tokens < -CLIENT_MESSAGE_BURST) ServerKick(socket, "RateLimited", "Disconnecting (message rate limit) " + address);
+						return;
 					}
+					const Event = String(packet[0]);
+					if (Object.prototype.hasOwnProperty.call(EVENT_RATE_LIMITS, Event)) {
+						if (!EventBuckets.has(Event)) EventBuckets.set(Event, CommonTokenBucket(EVENT_RATE_LIMITS[Event][0] * EVENT_RATE_LIMIT_SCALE, EVENT_RATE_LIMITS[Event][1] * EVENT_RATE_LIMIT_SCALE));
+						if (!CommonTokenBucketTake(/** @type {TokenBucket} */ (EventBuckets.get(Event)), false)) {
+							ServerStats.DroppedMessages++;
+							return;
+						}
+					}
+					next();
 				});
 
 				// Refuses the packets that would overflow the stack of the recursive code, and binary data that no handler expects
@@ -458,6 +466,9 @@ function ServerHealthReport() {
 	console.log(Report);
 	ServerEventLoopDelay.reset();
 	ServerStats = ServerStatsCreate();
+	for (const [Address, Bucket] of IPConnectionBuckets)
+		if (Bucket.Tokens + (CommonTime() - Bucket.Time) * Bucket.Rate / 1000 >= Bucket.Burst)
+			IPConnectionBuckets.delete(Address);
 }
 
 /**
@@ -579,6 +590,34 @@ function CommonIsInvalidPacket(data, MaxDepth) {
  */
 function CommonCount(Counters, Key) {
 	Counters[Key] = (Counters[Key] || 0) + 1;
+}
+
+/**
+ * Creates a token bucket: it holds up to Burst tokens and gains Rate tokens per second
+ * @param {number} Rate
+ * @param {number} Burst
+ * @returns {TokenBucket}
+ */
+function CommonTokenBucket(Rate, Burst) {
+	return { Rate: Rate, Burst: Burst, Tokens: Burst, Time: CommonTime() };
+}
+
+/**
+ * Takes a token from a bucket, returns FALSE if there was none left
+ * @param {TokenBucket} Bucket
+ * @param {boolean} AllowDebt - When TRUE, a refused request still takes a token
+ * @returns {boolean}
+ */
+function CommonTokenBucketTake(Bucket, AllowDebt) {
+	const Now = CommonTime();
+	Bucket.Tokens = Math.min(Bucket.Burst, Bucket.Tokens + (Now - Bucket.Time) * Bucket.Rate / 1000);
+	Bucket.Time = Now;
+	if (Bucket.Tokens >= 1) {
+		Bucket.Tokens--;
+		return true;
+	}
+	if (AllowDebt) Bucket.Tokens--;
+	return false;
 }
 
 /**

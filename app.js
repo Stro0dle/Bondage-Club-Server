@@ -828,6 +828,8 @@ async function AccountLoginProcess(socket, AccountName, Password) {
 
 	// Updates lovership to an array if needed for conversion
 	if (!Array.isArray(result.Lovership)) result.Lovership = (result.Lovership != undefined) ? [result.Lovership] : [];
+	result.Lovership = result.Lovership.filter(Lover => (Lover != null) && (typeof Lover === "object"));
+	AccountSanitizeRelationships(result);
 
 	// Sets the last login date
 	result.LastLogin = CommonTime();
@@ -847,6 +849,25 @@ async function AccountLoginProcess(socket, AccountName, Password) {
 	AccountSendServerInfo(socket);
 	AccountPurgeInfo(result);
 
+}
+
+/**
+ * Removes the objects found in the relationship fields where a number, a string or a boolean is expected
+ * @param {Partial<Account>} Acc
+ */
+function AccountSanitizeRelationships(Acc) {
+	const IsPrimitive = (/** @type {unknown} */ Value) => (Value == null) || (typeof Value !== "object");
+	const Clean = (/** @type {Record<string, unknown>} */ Obj) => {
+		for (const Key of Object.keys(Obj))
+			if (!IsPrimitive(Obj[Key]) && (Key !== "Notes"))
+				delete Obj[Key];
+	};
+	if (!IsPrimitive(Acc.Owner)) Acc.Owner = "";
+	if ((Acc.Ownership != null) && !CommonIsObject(Acc.Ownership)) Acc.Ownership = null;
+	if (Acc.Ownership != null) Clean(/** @type {any} */ (Acc.Ownership));
+	if (Array.isArray(Acc.Lovership)) for (const Lover of Acc.Lovership) Clean(/** @type {any} */ (Lover));
+	if ((Acc.Difficulty != null) && !CommonIsObject(Acc.Difficulty)) delete Acc.Difficulty;
+	if (Acc.Difficulty != null) Clean(/** @type {any} */ (Acc.Difficulty));
 }
 
 /**
@@ -2335,7 +2356,7 @@ function ChatRoomAccountHasAnyRole(Acc, room, roles) {
 function ChatRoomDominantValue(Account) {
 	if ((Account.Reputation != null) && (Array.isArray(Account.Reputation)))
 		for (const Rep of Account.Reputation)
-			if ((Rep.Type != null) && (Rep.Value != null) && (typeof Rep.Type === "string") && (typeof Rep.Value === "number") && (Rep.Type == "Dominant"))
+			if ((Rep != null) && (typeof Rep === "object") && (Rep.Type != null) && (Rep.Value != null) && (typeof Rep.Type === "string") && (typeof Rep.Value === "number") && (Rep.Type == "Dominant"))
 				return CommonParseInt(Rep.Value, 0);
 	return 0;
 }
@@ -2777,7 +2798,7 @@ function AccountLovership(data, socket) {
 						var TargetLoversNumbers = [];
 						if ((P != null) && Array.isArray(P))
 							for (const Lover of P)
-								TargetLoversNumbers.push(Lover.MemberNumber ? Lover.MemberNumber : -1);
+								TargetLoversNumbers.push((Lover != null) && Lover.MemberNumber ? Lover.MemberNumber : -1);
 
 						var TL = TargetLoversNumbers.indexOf(Acc.MemberNumber);
 						// Don't try to remove an already removed lover

@@ -47,6 +47,12 @@ var MaxHeapUsage = parseInt(process.env.MAX_HEAP_USAGE, 10) || 16_000_000_000; /
 var AccountCollection = process.env.ACCOUNT_COLLECTION || "Accounts";
 /** @type {Account[]} */
 var Account = [];
+/** @type {Map<string, Account>} */
+const AccountByID = new Map();
+/** @type {Map<number, Account>} */
+const AccountByMemberNumber = new Map();
+/** @type {Map<string, Account>} */
+const AccountByName = new Map();
 /** @type {Chatroom[]} */
 var ChatRoom = [];
 var ChatRoomMessageType = ["Chat", "Action", "Activity", "Emote", "Whisper", "Hidden", "Status"];
@@ -576,7 +582,7 @@ function AccountCreate(data, socket) {
 							account.Socket = socket;
 							console.log("Creating new account: " + account.AccountName + " ID: " + socket.id + " " + account.Environment);
 							AccountValidData(account);
-							Account.push(account);
+							AccountAdd(account);
 							OnLogin(socket);
 							socket.emit("CreationResponse", { ServerAnswer: "AccountCreated", OnlineID: account.ID, MemberNumber: account.MemberNumber } );
 							AccountSendServerInfo(socket);
@@ -824,13 +830,11 @@ async function AccountLoginProcess(socket, AccountName, Password) {
 	}
 
 	// Disconnect duplicated logged accounts
-	for (const Acc of Account) {
-		if (Acc != null && Acc.AccountName === result.AccountName) {
-			Acc.Socket.emit("ForceDisconnect", "ErrorDuplicatedLogin");
-			Acc.Socket.disconnect(true);
-			AccountRemove(Acc.ID);
-			break;
-		}
+	const DuplicateAcc = AccountByName.get(result.AccountName);
+	if (DuplicateAcc != null) {
+		DuplicateAcc.Socket.emit("ForceDisconnect", "ErrorDuplicatedLogin");
+		DuplicateAcc.Socket.disconnect(true);
+		AccountRemove(DuplicateAcc.ID);
 	}
 
 	// Assigns a member number if there's none
@@ -855,7 +859,7 @@ async function AccountLoginProcess(socket, AccountName, Password) {
 	result.Environment = AccountGetEnvironment(socket);
 	AccountValidData(result);
 	AccountRemoveFromChatRoom(result.MemberNumber);
-	Account.push(result);
+	AccountAdd(result);
 	OnLogin(socket);
 	delete result.Password;
 	delete result.Email;
@@ -1169,32 +1173,32 @@ function AccountQuery(data, socket) {
 				// Add all submissives owned by the player and all lovers of the players to the list
 				/** @type {ServerFriendInfo[]} */
 				var Friends = [];
-				var Index = [];
+				/** @type {Set<number>} */
+				var Index = new Set();
 				for (const OtherAcc of Account) {
-					var LoversNumbers = [];
-					for (var L = 0; L < OtherAcc.Lovership.length; L++) {
-						if ((OtherAcc.Lovership[L] != null) && (OtherAcc.Lovership[L].MemberNumber != null)) { LoversNumbers.push(OtherAcc.Lovership[L].MemberNumber); }
-					}
 					if (OtherAcc.Environment == Acc.Environment) {
 						var IsOwned = (OtherAcc.Ownership != null) && (OtherAcc.Ownership.MemberNumber != null) && (OtherAcc.Ownership.MemberNumber == Acc.MemberNumber);
-						var IsLover = LoversNumbers.indexOf(Acc.MemberNumber) >= 0;
+						var IsLover = false;
+						for (const Lover of OtherAcc.Lovership)
+							if ((Lover != null) && (Lover.MemberNumber != null) && (Lover.MemberNumber === Acc.MemberNumber)) {
+								IsLover = true;
+								break;
+							}
 						if (IsOwned || IsLover) {
 							Friends.push(AccountQueryGetFriendInfo(IsOwned ? "Submissive" : "Lover", OtherAcc));
-							Index.push(OtherAcc.MemberNumber);
+							Index.add(OtherAcc.MemberNumber);
 						}
 					}
 				}
 
 				// Builds the online friend list, both players must be friends to find each other
-				for (var F = 0; F < Acc.FriendList.length; F++)
-					if ((Acc.FriendList[F] != null) && (typeof Acc.FriendList[F] === "number"))
-						if (Index.indexOf(Acc.FriendList[F]) < 0) // No need to search for the friend if she's owned
-							for (const OtherAcc of Account)
-								if (OtherAcc.MemberNumber == Acc.FriendList[F]) {
-									if ((OtherAcc.Environment == Acc.Environment) && (OtherAcc.FriendList != null) && (OtherAcc.FriendList.indexOf(Acc.MemberNumber) >= 0))
-										Friends.push(AccountQueryGetFriendInfo("Friend", OtherAcc));
-									break;
-								}
+				for (const FriendNumber of Acc.FriendList)
+					if ((FriendNumber != null) && (typeof FriendNumber === "number"))
+						if (!Index.has(FriendNumber)) { // No need to search for the friend if she's owned
+							const OtherAcc = AccountByMemberNumber.get(FriendNumber);
+							if ((OtherAcc != null) && (OtherAcc.Environment == Acc.Environment) && (OtherAcc.FriendList != null) && (OtherAcc.FriendList.indexOf(Acc.MemberNumber) >= 0))
+								Friends.push(AccountQueryGetFriendInfo("Friend", OtherAcc));
+						}
 
 				// Sends the query result to the client
 				socket.emit("AccountQueryResult", { Query: data.Query, Result: Friends });
@@ -1225,21 +1229,23 @@ function AccountBeep(data, socket) {
 
 		// Make sure both accounts are online, friends and sends the beep to the friend
 		var Acc = AccountGet(socket.id);
-		if (Acc != null)
-			for (const OtherAcc of Account)
-				if (OtherAcc.MemberNumber == data.MemberNumber)
-					if ((OtherAcc.Environment == Acc.Environment) && (((OtherAcc.FriendList != null) && (OtherAcc.FriendList.indexOf(Acc.MemberNumber) >= 0)) || ((OtherAcc.Ownership != null) && (OtherAcc.Ownership.MemberNumber != null) && (OtherAcc.Ownership.MemberNumber == Acc.MemberNumber)) || ((data.BeepType != null) && (typeof data.BeepType === "string") && (data.BeepType == "Leash") && Array.isArray(OtherAcc.BlackList) && (OtherAcc.BlackList.indexOf(Acc.MemberNumber) < 0)))) {
-						OtherAcc.Socket.emit("AccountBeep", {
-							MemberNumber: Acc.MemberNumber,
-							MemberName: Acc.Name,
-							ChatRoomSpace: (Acc.ChatRoom == null || data.IsSecret) ? null : Acc.ChatRoom.Space,
-							ChatRoomName: (Acc.ChatRoom == null || data.IsSecret) ? null : Acc.ChatRoom.Name,
-							Private: (Acc.ChatRoom == null || data.IsSecret) ? null : ChatRoomRoleListIsRestrictive(Acc.ChatRoom.Visibility),
-							BeepType: (data.BeepType) ? data.BeepType : null,
-							Message: data.Message
-						});
-						break;
-					}
+		var OtherAcc = AccountByMemberNumber.get(data.MemberNumber);
+		if ((Acc != null) && (OtherAcc != null) && (OtherAcc.Environment == Acc.Environment)) {
+			const IsFriend = (OtherAcc.FriendList != null) && (OtherAcc.FriendList.indexOf(Acc.MemberNumber) >= 0);
+			const IsOwner = (OtherAcc.Ownership != null) && (OtherAcc.Ownership.MemberNumber != null) && (OtherAcc.Ownership.MemberNumber == Acc.MemberNumber);
+			const IsLeash = (data.BeepType != null) && (typeof data.BeepType === "string") && (data.BeepType == "Leash") && Array.isArray(OtherAcc.BlackList) && (OtherAcc.BlackList.indexOf(Acc.MemberNumber) < 0);
+			if (!IsFriend && !IsOwner && !IsLeash) return;
+
+			OtherAcc.Socket.emit("AccountBeep", {
+				MemberNumber: Acc.MemberNumber,
+				MemberName: Acc.Name,
+				ChatRoomSpace: (Acc.ChatRoom == null || data.IsSecret) ? null : Acc.ChatRoom.Space,
+				ChatRoomName: (Acc.ChatRoom == null || data.IsSecret) ? null : Acc.ChatRoom.Name,
+				Private: (Acc.ChatRoom == null || data.IsSecret) ? null : ChatRoomRoleListIsRestrictive(Acc.ChatRoom.Visibility),
+				BeepType: (data.BeepType) ? data.BeepType : null,
+				Message: data.Message
+			});
+		}
 
 	}
 }
@@ -1266,26 +1272,37 @@ function AccountDelayedUpdate() {
 	}
 }
 
-// Removes the account from the buffer
+/**
+ * Adds a logged account to the buffer
+ * @param {Account} Acc
+ */
+function AccountAdd(Acc) {
+	Account.push(Acc);
+	AccountByID.set(Acc.ID, Acc);
+	AccountByMemberNumber.set(Acc.MemberNumber, Acc);
+	AccountByName.set(Acc.AccountName, Acc);
+}
+
 /**
  * Removes the account from the buffer
  * @param {string} ID
  */
 function AccountRemove(ID) {
-	if (ID != null)
-		for (const Acc of Account)
-			if (Acc.ID == ID) {
-				let AccName = Acc.AccountName;
-				let AccDelayedAppearanceUpdate = Acc.DelayedAppearanceUpdate;
-				let AccDelayedSkillUpdate = Acc.DelayedSkillUpdate;
-				let AccDelayedGameUpdate = Acc.DelayedGameUpdate;
-				ChatRoomRemove(Acc, "ServerDisconnect", []);
-				const index = Account.indexOf(Acc);
-				if (index >= 0)
-					Account.splice(index, 1);
-				AccountDelayedUpdateOne(AccName, AccDelayedAppearanceUpdate, AccDelayedSkillUpdate, AccDelayedGameUpdate);
-				break;
-			}
+	if (ID == null) return;
+	const Acc = AccountByID.get(ID);
+	if (Acc == null) return;
+	let AccName = Acc.AccountName;
+	let AccDelayedAppearanceUpdate = Acc.DelayedAppearanceUpdate;
+	let AccDelayedSkillUpdate = Acc.DelayedSkillUpdate;
+	let AccDelayedGameUpdate = Acc.DelayedGameUpdate;
+	ChatRoomRemove(Acc, "ServerDisconnect", []);
+	AccountByID.delete(ID);
+	if (AccountByMemberNumber.get(Acc.MemberNumber) === Acc) AccountByMemberNumber.delete(Acc.MemberNumber);
+	if (AccountByName.get(Acc.AccountName) === Acc) AccountByName.delete(Acc.AccountName);
+	const index = Account.indexOf(Acc);
+	if (index >= 0)
+		Account.splice(index, 1);
+	AccountDelayedUpdateOne(AccName, AccDelayedAppearanceUpdate, AccDelayedSkillUpdate, AccDelayedGameUpdate);
 }
 
 /**
@@ -1294,10 +1311,7 @@ function AccountRemove(ID) {
  * @returns {Account|null}
  */
 function AccountGet(ID) {
-	for (const Acc of Account)
-		if (Acc.ID == ID)
-			return Acc;
-	return null;
+	return AccountByID.get(ID) || null;
 }
 
 /**
@@ -1603,7 +1617,7 @@ function ChatRoomJoin(data, socket) {
 									if (Acc.ChatRoom == null || Acc.ChatRoom.ID !== Room.ID) {
 										ChatRoomRemove(Acc, "ServerLeave", []);
 										Acc.ChatRoom = Room;
-										if (Account.find(A => Acc.MemberNumber === A.MemberNumber)) {
+										if (AccountByMemberNumber.has(Acc.MemberNumber)) {
 											Room.Account.push(Acc);
 											socket.join("chatroom-" + Room.ID);
 											socket.emit("ChatRoomSearchResponse", "JoinedRoom");
@@ -2615,7 +2629,7 @@ function AccountOwnership(data, socket) {
 				if ((result != null) && (result.MemberNumber != null) && (result.MemberNumber === data.MemberNumber) && (result.Ownership != null) && (result.Ownership.MemberNumber === Acc.MemberNumber)) {
 					Database.collection(AccountCollection).updateOne({ AccountName : result.AccountName }, { $set: { Owner: "", Ownership: null } }, DatabaseLogError("updating an account"));
 					ChatRoomMessage(Acc.ChatRoom, Acc.MemberNumber, "ReleaseSuccess", "ServerMessage", Acc.MemberNumber);
-					let Target = Account.find(A => A.MemberNumber === data.MemberNumber);
+					let Target = AccountByMemberNumber.get(data.MemberNumber);
 					if (!Target) return;
 					Target.Owner = "";
 					Target.Ownership = null;
@@ -2821,13 +2835,13 @@ function AccountLovership(data, socket) {
 							if (Array.isArray(P)) P.splice(TL, 1);
 							else P = [];
 
-							for (const OtherAcc of Account)
-								if (OtherAcc.MemberNumber == data.MemberNumber) {
-									OtherAcc.Lovership = P;
-									OtherAcc.Socket.emit("AccountLovership", { Lovership: OtherAcc.Lovership });
-									if (OtherAcc.ChatRoom != null)
-										ChatRoomSyncCharacter(OtherAcc.ChatRoom, OtherAcc.MemberNumber, OtherAcc.MemberNumber);
-								}
+							const OtherAcc = AccountByMemberNumber.get(data.MemberNumber);
+							if (OtherAcc != null) {
+								OtherAcc.Lovership = P;
+								OtherAcc.Socket.emit("AccountLovership", { Lovership: OtherAcc.Lovership });
+								if (OtherAcc.ChatRoom != null)
+									ChatRoomSyncCharacter(OtherAcc.ChatRoom, OtherAcc.MemberNumber, OtherAcc.MemberNumber);
+							}
 
 							AccountUpdateLovership(P, data.MemberNumber, null, false);
 						}

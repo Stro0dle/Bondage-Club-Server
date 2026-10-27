@@ -1,4 +1,8 @@
 "use strict";
+
+// bcrypt and the websocket compression run on the libuv thread pool, it must be set before loading the modules
+if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = "16";
+
 require('newrelic');
 const base64id = require("base64id");
 const crypto = require('crypto');

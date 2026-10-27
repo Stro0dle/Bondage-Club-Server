@@ -104,6 +104,7 @@ const ROOM_LIMIT_MINIMUM = 2; // The minimum number of players in an online chat
 const ROOM_LIMIT_MAXIMUM = 20; // The maximum number of players in an online chat room
 const LOGIN_CONCURRENCY = parseInt(process.env.LOGIN_CONCURRENCY, 10) || 4; // The number of logins processed at the same time
 const SLOW_HANDLER_DELAY = 100; // A handler running longer than this (ms) is logged
+const SHUTDOWN_DELAY = parseInt(process.env.SHUTDOWN_DELAY, 10) || 22000; // Delay between SIGTERM and the final save, Heroku kills the process after 30 seconds
 
 // Limits the number of accounts created on each hour & day
 /** @type {{ Address: string; Time: number; }[]} */
@@ -193,11 +194,14 @@ process.on('uncaughtException', function(error) {
 	ServerExit(1, "Bondage Club Server Crash", "Unhandled error occurred:<br />" + error.stack);
 });
 
-// When SIGTERM is received, we send a warning to all logged accounts
+// When SIGTERM is received, we send a warning to all logged accounts, then save them and exit before the host kills the process
+var ServerShuttingDown = false;
 process.on('SIGTERM', function() {
 	console.log("***********************");
 	console.log("HEROKU SIGTERM DETECTED");
 	console.log("***********************");
+	if (ServerShuttingDown) return;
+	ServerShuttingDown = true;
 	try {
 		AccountDelayedUpdate();
 	} catch (error) {
@@ -206,6 +210,14 @@ process.on('SIGTERM', function() {
 	for (const Acc of Account)
 		if ((Acc != null) && (Acc.Socket != null))
 			Acc.Socket.emit("ServerMessage", "Server will reboot in 30 seconds." );
+	const Wait = (/** @type {number} */ Delay) => new Promise(resolve => setTimeout(resolve, Delay));
+	Wait(SHUTDOWN_DELAY)
+		.then(() => Promise.race([AccountDelayedUpdate(), Wait(4000)]))
+		.then(() => Promise.race([new Promise(resolve => IO.close(() => resolve(undefined))), Wait(2000)]))
+		.then(() => {
+			console.log("Server closed after saving the accounts");
+			process.exit(0);
+		});
 });
 
 /** @type {Map<string, number>} */

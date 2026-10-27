@@ -730,9 +730,9 @@ function AccountLoginRun() {
 // Removes all instances of that character from all chat rooms
 function AccountRemoveFromChatRoom(MemberNumber) {
 	if ((MemberNumber == null) || (Account == null) || (Account.length == 0) || (ChatRoom == null) || (ChatRoom.length == 0)) return;
-	for (let C = 0; C < ChatRoom.length; C++) {
+	for (let C = ChatRoom.length - 1; C >= 0; C--) {
 		if ((ChatRoom[C] != null) && (ChatRoom[C].Account != null) && (ChatRoom[C].Account.length > 0)) {
-			for (let A = 0; A < ChatRoom[C].Account.length; A++)
+			for (let A = ChatRoom[C].Account.length - 1; A >= 0; A--)
 				if ((ChatRoom[C].Account[A] != null) && (ChatRoom[C].Account[A].MemberNumber != null) && (ChatRoom[C].Account[A].MemberNumber == MemberNumber))
 					ChatRoom[C].Account.splice(A, 1);
 			if (ChatRoom[C].Account.length == 0)

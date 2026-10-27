@@ -1351,10 +1351,11 @@ function ChatRoomSearch(data, socket) {
 	const FullRooms = typeof data.FullRooms === "boolean" ? data.FullRooms : false;
 
 	// Checks if the user opted to ignore certain rooms
-	let IgnoredRooms = [];
+	/** @type {Set<string>} */
+	let IgnoredRooms = new Set();
 	if (Array.isArray(data.Ignore)) {
 		// Validate array, only strings are valid.
-		IgnoredRooms = data.Ignore.filter(R => typeof R === "string" && R.match(ServerChatRoomNameRegex)).map(r => r.toUpperCase());
+		IgnoredRooms = new Set(data.Ignore.filter(R => typeof R === "string" && R.match(ServerChatRoomNameRegex)).map(r => r.toUpperCase()));
 	}
 
 	// Grab the search language
@@ -1364,21 +1365,23 @@ function ChatRoomSearch(data, socket) {
 	} else if (Array.isArray(data.Language)) {
 		Languages = Languages.concat(data.Language);
 	}
+	const LanguageSet = new Set(Languages);
+	const SpaceSet = new Set(Spaces);
 
 	// Whether we also search the room descriptions
 	const SearchDescs = typeof data.SearchDescs === "boolean" ? data.SearchDescs : false;
 
 	// Check if we have a map type filter
-	let MapTypes = [];
+	/** @type {Set<string>} */
+	let MapTypes = new Set();
 	if (Array.isArray(data.MapTypes)) {
-		MapTypes = data.MapTypes.filter(t => typeof t === "string" && t.length < 20);
+		MapTypes = new Set(data.MapTypes.filter(t => typeof t === "string" && t.length < 20));
 	}
 
 	// Builds a list of all public rooms, the last rooms created are shown first
-	const rooms = [...ChatRoom].reverse();
-
 	const CR = [];
-	for (const room of rooms) {
+	for (let R = ChatRoom.length - 1; R >= 0; R--) {
+		const room = ChatRoom[R];
 		if (!room) continue;
 
 		const roomName = room.Name.toUpperCase();
@@ -1393,13 +1396,13 @@ function ChatRoomSearch(data, socket) {
 		if (room.Account.length >= room.Limit && !FullRooms) continue;
 
 		// Room isn't in the correct space, skip
-		if (!Spaces.includes(room.Space)) continue;
+		if (!SpaceSet.has(room.Space)) continue;
 
 		// Player is banned from the room, skip
 		if (room.Ban.includes(Acc.MemberNumber)) continue;
 
 		// Room is for a different language than requested, skip
-		if (Languages.length !== 0 && !Languages.includes(room.Language)) continue;
+		if (LanguageSet.size !== 0 && !LanguageSet.has(room.Language)) continue;
 
 		// We have a search query
 		if (Query !== "") {
@@ -1419,10 +1422,10 @@ function ChatRoomSearch(data, socket) {
 		if (!data.ShowLocked && !ChatRoomAccountHasAnyRole(Acc, room, room.Access)) continue;
 
 		// Room is in our ignore list, skip
-		if (IgnoredRooms.includes(roomName)) continue;
+		if (IgnoredRooms.has(roomName)) continue;
 
 		// Only allow requested map types
-		if (MapTypes.length > 0 && !MapTypes.includes(room.MapData?.Type)) continue;
+		if (MapTypes.size > 0 && !MapTypes.has(room.MapData?.Type)) continue;
 
 		const result = ChatRoomSearchAddResult(Acc, room);
 		if (!result) continue;
@@ -1528,8 +1531,9 @@ function ChatRoomCreate(data, socket) {
 			}
 
 			// Check if the same name already exists and quits if that's the case
+			const RoomName = data.Name.toUpperCase().trim();
 			for (const Room of ChatRoom)
-				if (Room.Name.toUpperCase().trim() == data.Name.toUpperCase().trim()) {
+				if (Room.Name.toUpperCase().trim() == RoomName) {
 					socket.emit("ChatRoomCreateResponse", "RoomAlreadyExist");
 					return;
 				}
@@ -1606,8 +1610,9 @@ function ChatRoomJoin(data, socket) {
 		if (Acc != null) {
 
 			// Finds the room and join it
+			const RoomName = data.Name.toUpperCase().trim();
 			for (const Room of ChatRoom)
-				if (Room.Name.toUpperCase().trim() == data.Name.toUpperCase().trim())
+				if (Room.Name.toUpperCase().trim() == RoomName)
 					if (Acc.Environment == Room.Environment)
 						if (Room.Account.length < Room.Limit) {
 							if (Room.Ban.indexOf(Acc.MemberNumber) < 0) {
@@ -1672,11 +1677,8 @@ function ChatRoomRemove(Acc, Reason, Dictionary) {
 
 		// Destroys the room if it's empty, warn other players if not
 		if (Acc.ChatRoom.Account.length == 0) {
-			for (var C = 0; C < ChatRoom.length; C++)
-				if (Acc.ChatRoom.Name == ChatRoom[C].Name) {
-					ChatRoom.splice(C, 1);
-					break;
-				}
+			const C = ChatRoom.indexOf(Acc.ChatRoom);
+			if (C >= 0) ChatRoom.splice(C, 1);
 		} else {
 			if (!Dictionary || (Dictionary.length == 0)) Dictionary.push({Tag: "SourceCharacter", Text: Acc.Name, MemberNumber: Acc.MemberNumber});
 			ChatRoomMessage(Acc.ChatRoom, Acc.MemberNumber, Reason, "Action", null, Dictionary);
@@ -2173,8 +2175,9 @@ function ChatRoomAdmin(data, socket) {
 				if ((data.Room != null) && (typeof data.Room === "object") && (data.Room.Name != null) && (data.Room.Description != null) && (data.Room.Background != null) && (typeof data.Room.Name === "string") && (typeof data.Room.Description === "string") && (typeof data.Room.Background === "string") && (data.Room.Admin != null) && (Array.isArray(data.Room.Admin)) && (!data.Room.Admin.some(i => !Number.isInteger(i))) && (data.Room.Ban != null) && (Array.isArray(data.Room.Ban)) && (!data.Room.Ban.some(i => !Number.isInteger(i)))) {
 					data.Room.Name = data.Room.Name.trim();
 					if (data.Room.Name.match(ServerChatRoomNameRegex) && (data.Room.Description.length <= ServerChatRoomDescriptionMaxLength) && (data.Room.Background.length <= 100)) {
+						const RoomName = data.Room.Name.toUpperCase().trim();
 						for (const Room of ChatRoom)
-							if (Acc.ChatRoom && Acc.ChatRoom.Name != data.Room.Name && Room.Name.toUpperCase().trim() == data.Room.Name.toUpperCase().trim()) {
+							if (Acc.ChatRoom && Acc.ChatRoom.Name != data.Room.Name && Room.Name.toUpperCase().trim() == RoomName) {
 								socket.emit("ChatRoomUpdateResponse", "RoomAlreadyExist");
 								return;
 							}

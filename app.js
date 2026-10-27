@@ -496,6 +496,9 @@ function AccountCreate(data, socket) {
 		// Makes sure the data is valid
 		if (data.Name.match(ServerCharacterNameRegex) && data.AccountName.match(ServerAccountNameRegex) && data.Password.match(ServerAccountPasswordRegex) && (CommonEmailIsValid(data.Email) || data.Email == "") && (data.Email.length <= 100)) {
 
+			// If connection already has a login or an account creation pending, ignore it
+			if (pendingLogins.has(socket)) return;
+
 			// Gets the current IP Address that's creating the account
 			let CurrentIP = AccountGetIP(socket);
 
@@ -526,11 +529,13 @@ function AccountCreate(data, socket) {
 
 			// Checks if the account already exists
 			data.AccountName = data.AccountName.toUpperCase();
+			pendingLogins.add(socket);
 			Database.collection(AccountCollection).findOne({ AccountName : data.AccountName }, function(err, result) {
 
 				// Makes sure the result is null so the account doesn't already exists
 				if (err) return AccountCreateFailed(socket, "checking if account " + data.AccountName + " exists", err);
 				if (result != null) {
+					pendingLogins.delete(socket);
 					socket.emit("CreationResponse", "Account already exists");
 				} else {
 
@@ -557,7 +562,16 @@ function AccountCreate(data, socket) {
 							BlackList: [],
 						});
 						Database.collection(AccountCollection).insertOne(account, function(err, res) {
+							pendingLogins.delete(socket);
+
+							// The unique index refused an account name created in the meantime
+							if (err && (err.code === 11000)) {
+								socket.emit("CreationResponse", "Account already exists");
+								return;
+							}
 							if (err) return AccountCreateFailed(socket, "creating account " + account.AccountName, err);
+							if (!socket.connected) return;
+
 							account.ID = socket.id;
 							account.Socket = socket;
 							console.log("Creating new account: " + account.AccountName + " ID: " + socket.id + " " + account.Environment);
@@ -587,6 +601,7 @@ function AccountCreate(data, socket) {
  * @param {Error} err
  */
 function AccountCreateFailed(socket, Context, err) {
+	pendingLogins.delete(socket);
 	DatabaseError(Context, err);
 	socket.emit("CreationResponse", "Invalid account information");
 }
@@ -649,15 +664,15 @@ function AccountLogin(data, socket) {
 		return;
 	}
 
+	// If connection already has login queued, ignore it
+	if (pendingLogins.has(socket)) return;
+
 	// Too many failed logins from that IP address
 	if (AccountLoginFailedTooOften(AccountGetIP(socket), data.AccountName.toUpperCase())) {
 		socket.emit("ForceDisconnect", "ErrorRateLimited");
 		socket.disconnect(true);
 		return;
 	}
-
-	// If connection already has login queued, ignore it
-	if (pendingLogins.has(socket)) return;
 
 	loginQueue.push([socket, data.AccountName.toUpperCase(), data.Password]);
 	pendingLogins.add(socket);
@@ -676,7 +691,7 @@ function AccountLogin(data, socket) {
 const loginQueue = [];
 
 /**
- * List of sockets, for which there already is a pending login - to prevent duplicate logins during wait time
+ * List of sockets, for which there already is a pending login or account creation - to prevent duplicate logins during wait time
  * @type {WeakSet.<ServerSocket>}
  */
 const pendingLogins = new WeakSet();

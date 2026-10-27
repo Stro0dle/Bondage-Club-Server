@@ -8,6 +8,7 @@ const base64id = require("base64id");
 const crypto = require('crypto');
 const { performance, monitorEventLoopDelay } = require('perf_hooks');
 const net = require('net');
+const v8 = require('v8');
 
 // Enforce https with a certificate
 var App;
@@ -49,7 +50,7 @@ var IO = new socketio.Server(App, Options);
 
 // Main game objects
 var BCrypt = require("bcrypt");
-var MaxHeapUsage = parseInt(process.env.MAX_HEAP_USAGE, 10) || 16_000_000_000; // 16 gigs allocated by default, can be altered server side
+var MaxHeapUsage = parseInt(process.env.MAX_HEAP_USAGE, 10) || Math.floor(v8.getHeapStatistics().heap_size_limit * 0.9); // 90% of the V8 heap limit by default, can be altered server side
 var AccountCollection = process.env.ACCOUNT_COLLECTION || "Accounts";
 /** @type {Account[]} */
 var Account = [];
@@ -149,6 +150,39 @@ var MailTransporter = NodeMailer.createTransport({
 });
 MailTransporter.on("error", err => console.log("Email transport error: " + err.message));
 
+var ServerExiting = false;
+
+/**
+ * Saves the delayed account updates, sends an email to the admin and exits so the application can restart
+ * @param {number} Code - The process exit code
+ * @param {string} Subject - The email subject
+ * @param {string} Body - The email HTML body
+ */
+function ServerExit(Code, Subject, Body) {
+	if (ServerExiting) return;
+	ServerExiting = true;
+	let Update;
+	try {
+		Update = AccountDelayedUpdate();
+	} catch (error) {
+		console.log("Error while doing delayed updates");
+	}
+	var mailOptions = {
+		from: "donotreply@bondageprojects.com",
+		to: process.env.EMAIL_ADMIN || "",
+		subject: Subject,
+		html: Body
+	};
+	const Mail = MailTransporter.sendMail(mailOptions).then(
+		() => console.log("Error email was sent"),
+		err => console.log("Error while sending error email: " + err)
+	);
+
+	// Waits for the database writes and the email, but never more than 10 seconds
+	const Timeout = new Promise(resolve => setTimeout(resolve, 10000));
+	Promise.race([Promise.allSettled([Update, Mail]), Timeout]).then(() => process.exit(Code));
+}
+
 // If the server received an unhandled error, we log it through console for future review, send an email and exit so the application can restart
 Error.stackTraceLimit = 100;
 process.on('uncaughtException', function(error) {
@@ -156,22 +190,7 @@ process.on('uncaughtException', function(error) {
 	console.log("Unhandled error occurred:");
 	console.log(error.stack);
 	console.log("*************************");
-	var mailOptions = {
-		from: "donotreply@bondageprojects.com",
-		to: process.env.EMAIL_ADMIN || "",
-		subject: "Bondage Club Server Crash",
-		html: "Unhandled error occurred:<br />" + error.stack
-	};
-	MailTransporter.sendMail(mailOptions, function (err, info) {
-		if (err) console.log("Error while sending error email: " + err);
-		else console.log("Error email was sent");
-		try {
-			AccountDelayedUpdate();
-		} catch (error) {
-			console.log("Error while doing delayed updates");
-		}
-		process.exit(1);
-	});
+	ServerExit(1, "Bondage Club Server Crash", "Unhandled error occurred:<br />" + error.stack);
 });
 
 // When SIGTERM is received, we send a warning to all logged accounts
@@ -499,25 +518,12 @@ function ServerInterval(Task, Delay) {
 function AccountSendServerInfo(socket) {
 
 	// Validates if the heap usage is too high and we should reboot, to prevent memory leaks
-	const MemoryData = process.memoryUsage();
-	if ((MemoryData != null) && (MemoryData.heapUsed > MaxHeapUsage)) {
-		var mailOptions = {
-			from: "donotreply@bondageprojects.com",
-			to: process.env.EMAIL_ADMIN || "",
-			subject: "Bondage Club Server Heap Usage Crash",
-			html: "Heap usage error occured:<br />heapTotal: " + MemoryData.heapTotal.toString() + "<br />heapUsed: " + MemoryData.heapUsed.toString()
-		};
-		MailTransporter.sendMail(mailOptions, function (err, info) {
-			if (err) console.log("Error while sending error email: " + err);
-			else console.log("Error email was sent");
-			try {
-				AccountDelayedUpdate();
-			} catch (error) {
-				console.log("Error while doing delayed updates");
-			}
-			process.exit(2);
-		});
-		return;
+	if (socket == null) {
+		const MemoryData = process.memoryUsage();
+		if ((MemoryData != null) && (MemoryData.heapUsed > MaxHeapUsage)) {
+			ServerExit(2, "Bondage Club Server Heap Usage Crash", "Heap usage error occured:<br />heapTotal: " + MemoryData.heapTotal.toString() + "<br />heapUsed: " + MemoryData.heapUsed.toString());
+			return;
+		}
 	}
 
 	// Sends the info to all players

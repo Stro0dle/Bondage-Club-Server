@@ -6,6 +6,7 @@ if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = "16";
 require('newrelic');
 const base64id = require("base64id");
 const crypto = require('crypto');
+const { performance, monitorEventLoopDelay } = require('perf_hooks');
 
 // Enforce https with a certificate
 var App;
@@ -92,6 +93,7 @@ const ROOM_LIMIT_DEFAULT = 10; // The default number of players in an online cha
 const ROOM_LIMIT_MINIMUM = 2; // The minimum number of players in an online chat room
 const ROOM_LIMIT_MAXIMUM = 20; // The maximum number of players in an online chat room
 const LOGIN_CONCURRENCY = parseInt(process.env.LOGIN_CONCURRENCY, 10) || 4; // The number of logins processed at the same time
+const SLOW_HANDLER_DELAY = 100; // A handler running longer than this (ms) is logged
 
 // Limits the number of accounts created on each hour & day
 /** @type {{ Address: string; Time: number; }[]} */
@@ -180,6 +182,18 @@ process.on('SIGTERM', function() {
 
 /** @type {Map<string, number[]>} */
 const IPConnections = new Map();
+
+const SERVER_EVENT_LOOP_RESOLUTION = 20;
+const ServerEventLoopDelay = monitorEventLoopDelay({ resolution: SERVER_EVENT_LOOP_RESOLUTION });
+
+/**
+ * Creates the counters of the health report
+ * @returns {{ Disconnects: Record<string, number>; Kicks: Record<string, number>; DroppedMessages: number; HandlerErrors: number; }}
+ */
+function ServerStatsCreate() {
+	return { Disconnects: {}, Kicks: {}, DroppedMessages: 0, HandlerErrors: 0 };
+}
+var ServerStats = ServerStatsCreate();
 
 // These regex must be kept in sync with the client
 const ServerAccountEmailRegex = /^[a-zA-Z0-9@.!#$%&'*+/=?^_`{|}~-]{5,100}$/;
@@ -280,6 +294,7 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 			console.log("****************************************");
 			IO.on("connection", function ( /** @type {ServerSocket} */ socket) {
 				const address = AccountGetIP(socket);
+				socket.on("disconnect", reason => CommonCount(ServerStats.Disconnects, reason));
 
 				const sameIPConnections = IPConnections.get(address) || [];
 
@@ -288,9 +303,7 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 
 				// Reject connection if over limits (rate & concurrency)
 				if (sameIPConnections.length >= IP_CONNECTION_LIMIT || ipOverRateLimit) {
-					console.log("Rejecting connection (IP connection limit reached) from", address);
-					socket.emit("ForceDisconnect", "ErrorRateLimited");
-					socket.disconnect(true);
+					ServerKick(socket, "ConnectionLimit", "Rejecting connection (IP connection limit reached) from " + address);
 					return;
 				}
 
@@ -319,17 +332,14 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 					// More than CLIENT_MESSAGE_RATE_LIMIT number of messages in the last second
 					if (Date.now() - lastMessageTime <= 1000) {
 						// Disconnect and close connection
-						socket.emit("ForceDisconnect", "ErrorRateLimited");
-						socket.disconnect(true);
+						ServerKick(socket, "RateLimited");
 					}
 				});
 
 				// Refuses the packets that would overflow the stack of the recursive code, and binary data that no handler expects
 				socket.use((packet, next) => {
 					if (CommonIsInvalidPacket(packet, MAX_PACKET_DEPTH)) {
-						console.log("Rejecting invalid packet from " + address);
-						socket.emit("ForceDisconnect", "ErrorRateLimited");
-						socket.disconnect(true);
+						ServerKick(socket, "InvalidPacket", "Rejecting invalid packet from " + address);
 						return;
 					}
 					next();
@@ -342,8 +352,11 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 				AccountSendServerInfo(socket);
 			});
 
+			ServerEventLoopDelay.enable();
+
 			// Refreshes the server information to clients each 60 seconds
 			ServerInterval(() => AccountSendServerInfo(), 60000);
+			ServerInterval(ServerHealthReport, 60000);
 
 			// Updates the database appearance & skills every 300 seconds
 			ServerInterval(AccountDelayedUpdate, 300000);
@@ -387,19 +400,64 @@ function OnLogin(socket) {
 }
 
 /**
- * Registers an event handler, its errors are logged instead of crashing the server
+ * Registers an event handler, its errors and slow runs are logged instead of crashing the server
  * @param {ServerSocket} socket
  * @param {string} Event
  * @param {(data: any) => void} Handler
  */
 function ServerOn(socket, Event, Handler) {
 	socket.on(/** @type {any} */ (Event), function(/** @type {any} */ data) {
+		const Start = performance.now();
 		try {
 			Handler(data);
 		} catch (error) {
-			console.log("Error while handling " + Event + " from " + socket.id + ": " + ((error && error.stack) || error));
+			ServerStats.HandlerErrors++;
+			console.log("Error while handling " + Event + " from " + ServerSocketName(socket) + ": " + ((error && error.stack) || error));
 		}
+		const Duration = performance.now() - Start;
+		if (Duration > SLOW_HANDLER_DELAY) console.log("Slow handler: " + Event + " took " + Math.round(Duration) + "ms for " + ServerSocketName(socket));
 	});
+}
+
+/**
+ * Returns the account name and the socket ID, for the logs
+ * @param {ServerSocket} socket
+ * @returns {string}
+ */
+function ServerSocketName(socket) {
+	const Acc = AccountGet(socket.id);
+	return (Acc != null) ? Acc.AccountName + " (" + socket.id + ")" : socket.id;
+}
+
+/**
+ * Disconnects a client, the reason is counted for the health report
+ * @param {ServerSocket} socket
+ * @param {string} Reason
+ * @param {string} [Message] - Logged message
+ */
+function ServerKick(socket, Reason, Message) {
+	if (!socket.connected) return;
+	CommonCount(ServerStats.Kicks, Reason);
+	if (Message) console.log(Message);
+	socket.emit("ForceDisconnect", "ErrorRateLimited");
+	socket.disconnect(true);
+}
+
+/**
+ * Logs the server health, called every minute
+ */
+function ServerHealthReport() {
+	const Delay = (/** @type {number} */ ns) => Math.max(0, Math.round(ns / 1000000) - SERVER_EVENT_LOOP_RESOLUTION) + "ms";
+	let Report = "Server health - Online: " + Account.length + ", Rooms: " + ChatRoom.length
+		+ ", Event loop delay p50/p99/max: " + Delay(ServerEventLoopDelay.percentile(50)) + "/" + Delay(ServerEventLoopDelay.percentile(99)) + "/" + Delay(ServerEventLoopDelay.max)
+		+ ", Heap: " + Math.round(process.memoryUsage().heapUsed / 1048576) + "MB";
+	if (Object.keys(ServerStats.Disconnects).length > 0) Report += ", Disconnects: " + JSON.stringify(ServerStats.Disconnects);
+	if (Object.keys(ServerStats.Kicks).length > 0) Report += ", Kicks: " + JSON.stringify(ServerStats.Kicks);
+	if (ServerStats.DroppedMessages > 0) Report += ", Dropped messages: " + ServerStats.DroppedMessages;
+	if (ServerStats.HandlerErrors > 0) Report += ", Handler errors: " + ServerStats.HandlerErrors;
+	console.log(Report);
+	ServerEventLoopDelay.reset();
+	ServerStats = ServerStatsCreate();
 }
 
 /**
@@ -512,6 +570,15 @@ function CommonIsInvalidPacket(data, MaxDepth) {
 		}
 	}
 	return false;
+}
+
+/**
+ * Adds one to a counter of a record
+ * @param {Record<string, number>} Counters
+ * @param {string} Key
+ */
+function CommonCount(Counters, Key) {
+	Counters[Key] = (Counters[Key] || 0) + 1;
 }
 
 /**

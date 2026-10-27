@@ -312,10 +312,10 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 			});
 
 			// Refreshes the server information to clients each 60 seconds
-			setInterval(AccountSendServerInfo, 60000);
+			ServerInterval(() => AccountSendServerInfo(), 60000);
 
 			// Updates the database appearance & skills every 300 seconds
-			setInterval(AccountDelayedUpdate, 300000);
+			ServerInterval(AccountDelayedUpdate, 300000);
 
 		});
 	});
@@ -369,6 +369,21 @@ function ServerOn(socket, Event, Handler) {
 			console.log("Error while handling " + Event + " from " + socket.id + ": " + ((error && error.stack) || error));
 		}
 	});
+}
+
+/**
+ * Runs a task periodically, its errors are logged instead of crashing the server
+ * @param {() => void} Task
+ * @param {number} Delay
+ */
+function ServerInterval(Task, Delay) {
+	setInterval(() => {
+		try {
+			Task();
+		} catch (error) {
+			console.log("Error in a periodic task: " + ((error && error.stack) || error));
+		}
+	}, Delay);
 }
 
 /**

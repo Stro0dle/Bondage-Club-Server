@@ -109,6 +109,7 @@ var DatabaseClient = require('mongodb').MongoClient;
 var DatabaseURL = process.env.DATABASE_URL || "mongodb://localhost:27017/BondageClubDatabase";
 var ServerPort = process.env.PORT || 4288;
 var DatabaseName = process.env.DATABASE_NAME || "BondageClubDatabase";
+var DatabasePoolSize = parseInt(process.env.DATABASE_POOL_SIZE, 10) || 50; // Maximum number of MongoDB connections
 
 /**
  * Email password reset
@@ -230,8 +231,27 @@ function DatabaseLogError(Context) {
 	return function(err) { if (err) DatabaseError(Context, err); };
 }
 
+/**
+ * Creates the indexes of the account queries, the errors are only logged
+ * @returns {Promise<void>}
+ */
+async function DatabaseCreateIndexes() {
+	const Collection = Database.collection(AccountCollection);
+	const LogError = (/** @type {string} */ Name) => (/** @type {Error} */ err) => console.log("Error while creating database index " + Name + ": " + err.message);
+	const AccountNameIndex = Collection.createIndex({ AccountName: 1 }, { unique: true }).catch(err => {
+		LogError("AccountName (unique)")(err);
+		return Collection.createIndex({ AccountName: 1 }).catch(LogError("AccountName"));
+	});
+	await Promise.all([
+		AccountNameIndex,
+		Collection.createIndex({ MemberNumber: 1 }).catch(LogError("MemberNumber")),
+		Collection.createIndex({ Email: 1 }).catch(LogError("Email"))
+	]);
+	console.log("Database indexes are ready");
+}
+
 // Connects to the Mongo Database
-DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser: true, autoIndex: false }, function(err, db) {
+DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser: true, poolSize: DatabasePoolSize }, function(err, db) {
 
 	// Keeps the database object
 	if (err) throw err;
@@ -246,6 +266,7 @@ DatabaseClient.connect(DatabaseURL, { useUnifiedTopology: true, useNewUrlParser:
 		// Shows the next member number
 		if ((result.length > 0) && (result[0].MemberNumber != null)) NextMemberNumber = result[0].MemberNumber + 1;
 		console.log("Next Member Number: " + NextMemberNumber);
+		if (process.env.DATABASE_CREATE_INDEXES === "true") DatabaseCreateIndexes();
 
 		// Listens for clients on port 4288 if local or a random port if online
 		App.listen(ServerPort, function () {
@@ -1207,10 +1228,10 @@ function AccountQuery(data, socket) {
 
 			// EmailStatus query - returns true if an email is linked to the account
 			if (data.Query == "EmailStatus") {
-				Database.collection(AccountCollection).find({ AccountName : Acc.AccountName }).toArray(function(err, result) {
+				Database.collection(AccountCollection).findOne({ AccountName : Acc.AccountName }, { projection: { Email: 1, _id: 0 } }, function(err, result) {
 					if (err) return DatabaseError("reading an email status", err);
-					if ((result != null) && (typeof result === "object") && (result.length > 0)) {
-						socket.emit("AccountQueryResult", /** @type {ServerAccountQueryEmailStatus} */ ({ Query: data.Query, Result: ((result[0].Email != null) && (result[0].Email != "")) }));
+					if ((result != null) && (typeof result === "object")) {
+						socket.emit("AccountQueryResult", /** @type {ServerAccountQueryEmailStatus} */ ({ Query: data.Query, Result: ((result.Email != null) && (result.Email != "")) }));
 					}
 				});
 			}
@@ -2623,7 +2644,7 @@ function AccountOwnership(data, socket) {
 		if (!TargetAcc && (data.Action === "Release") && (Acc.MemberNumber != null) && (data.MemberNumber != null)) {
 
 			// Gets the account linked to that member number, make sure
-			Database.collection(AccountCollection).findOne({ MemberNumber : data.MemberNumber }, function(err, result) {
+			Database.collection(AccountCollection).findOne({ MemberNumber : data.MemberNumber }, { projection: { AccountName: 1, MemberNumber: 1, Ownership: 1, _id: 0 } }, function(err, result) {
 				if (err) {
 					DatabaseError("finding the submissive to release", err);
 					ChatRoomMessage(Acc.ChatRoom, Acc.MemberNumber, "ReleaseFail", "ServerMessage", Acc.MemberNumber);
@@ -2822,7 +2843,7 @@ function AccountLovership(data, socket) {
 
 				// Update the other account if she's online, then update the database
 				var P = [];
-				Database.collection(AccountCollection).find({ MemberNumber : data.MemberNumber }).sort({MemberNumber: -1}).limit(1).toArray(function(err, result) {
+				Database.collection(AccountCollection).find({ MemberNumber : data.MemberNumber }, { projection: { Lovership: 1, _id: 0 } }).sort({MemberNumber: -1}).limit(1).toArray(function(err, result) {
 					if (err) return DatabaseError("finding the lover to break up with", err);
 					if ((result != null) && (typeof result === "object") && (result.length > 0)) {
 						P = result[0].Lovership;

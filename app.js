@@ -7,6 +7,7 @@ require('newrelic');
 const base64id = require("base64id");
 const crypto = require('crypto');
 const { performance, monitorEventLoopDelay } = require('perf_hooks');
+const net = require('net');
 
 // Enforce https with a certificate
 var App;
@@ -96,7 +97,7 @@ const EVENT_RATE_LIMIT_SCALE = parseFloat(process.env.EVENT_RATE_LIMIT_SCALE) ||
 const BEEP_RATE_LIMIT = 2; // Beeps a player can send per second
 const BEEP_BURST = 20; // Beeps a player can send at once
 const MAX_PACKET_DEPTH = 100; // Maximum nesting of objects & arrays in a client packet
-const IP_CONNECTION_PROXY_HEADER = "x-forwarded-for"; // Header with real IP, if set by trusted proxy (lowercase)
+const IP_CONNECTION_PROXY_HEADER = (process.env.IP_CONNECTION_PROXY_HEADER ?? "x-forwarded-for").toLowerCase(); // Header with real IP, if set by trusted proxy, empty when there is no proxy
 const ROOM_LIMIT_DEFAULT = 10; // The default number of players in an online chat room
 const ROOM_LIMIT_MINIMUM = 2; // The minimum number of players in an online chat room
 const ROOM_LIMIT_MAXIMUM = 20; // The maximum number of players in an online chat room
@@ -895,7 +896,24 @@ function AccountGetIP(socket) {
 		const hops = /** @type {string} */ (socket.handshake.headers[IP_CONNECTION_PROXY_HEADER]).split(",");
 		address = hops[hops.length-1].trim();
 	}
-	return address;
+	return CommonIPGroup(address);
+}
+
+/**
+ * Returns the key used by the limits for an IP address, IPv6 addresses are grouped by /64
+ * @param {string} Address
+ * @returns {string}
+ */
+function CommonIPGroup(Address) {
+	if (typeof Address !== "string") return "";
+	Address = Address.split("%")[0];
+	if (Address.toLowerCase().startsWith("::ffff:") && net.isIPv4(Address.slice(7))) return Address.slice(7);
+	if (!net.isIPv6(Address)) return Address;
+	const Halves = Address.toLowerCase().split("::");
+	const Head = Halves[0] ? Halves[0].split(":") : [];
+	const Tail = (Halves.length > 1 && Halves[1]) ? Halves[1].split(":") : [];
+	const Groups = (Halves.length > 1) ? [...Head, ...new Array(Math.max(0, 8 - Head.length - Tail.length)).fill("0"), ...Tail] : Head;
+	return Groups.slice(0, 4).map(Group => parseInt(Group, 16).toString(16)).join(":") + "::/64";
 }
 
 /**

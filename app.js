@@ -14,7 +14,13 @@ const v8 = require('v8');
 var App;
 var UseSecure;
 UseSecure = false;
-App = require("http").createServer();
+// socket.io answers its own requests, the others get a 404
+App = require("http").createServer(function(req, res) {
+	res.writeHead(404, { "Content-Type": "text/plain" });
+	res.end("Not found");
+});
+App.headersTimeout = 20000;
+App.requestTimeout = 30000;
 App.on("error", function(err) {
 	if (!App.listening) throw err;
 	console.log("HTTP server error: " + err.message);
@@ -26,7 +32,7 @@ const socketio = require("socket.io");
 var Options = {
 	maxHttpBufferSize: 180000,
 	pingTimeout: 30000,
-	pingInterval: 50000,
+	pingInterval: 25000, // Under the 55 seconds idle timeout of the Heroku router
 	upgradeTimeout: 30000,
 	serveClient: false,
 	httpCompression: true,
